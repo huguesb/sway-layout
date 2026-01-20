@@ -139,8 +139,11 @@ func runSpawn(args []string) {
 	// args[0] = workspace, args[1] = path, args[2:] = command
 	cmdStr := strings.Join(args[2:], " ")
 
-	// Run the command via shell (don't exec - we need to stay in process tree)
-	cmd := exec.Command("/bin/sh", "-lc", cmdStr)
+	// Run the command via shell:
+	//  - don't exec from golang, we need to stay in process tree
+	//  - use a login shell to ensure sane PATH and other env vars
+	//  - exec from the shell to remove one layer of process tree
+	cmd := exec.Command("/bin/sh", "-lc", "exec "+cmdStr)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -371,7 +374,7 @@ func parseNode(node interface{}, path string, parentLayout string) *LayoutNode {
 	for i, child := range children {
 		childPath := strconv.Itoa(i)
 		if path != "" {
-			childPath = path + "." + childPath
+			childPath = path + "_" + childPath
 		}
 		if childNode := parseNode(child, childPath, layout); childNode != nil {
 			result.Children = append(result.Children, childNode)
@@ -415,6 +418,8 @@ func launchApps(apps []AppInfo) int {
 		if err := cmd.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "    Failed to launch: %v\n", err)
 			continue
+		} else {
+			fmt.Printf("    pid: %v\n", cmd.Process.Pid)
 		}
 		count++
 	}
@@ -729,84 +734,106 @@ func arrangeWorkspace(ws string, tree *LayoutNode, windowsByPath map[string][]in
 
 	fmt.Printf("  Arranging workspace %s: %d windows across %d paths, root layout=%s\n", ws, totalWindows, len(windowsByPath), tree.Layout)
 
-	// Focus workspace
 	swaymsg(fmt.Sprintf("workspace %s", ws))
+	swaymsg(fmt.Sprintf("layout %s", tree.Layout))
 
-	// Windows are already in scratchpad (moved there on creation)
-	// Arrange the tree - this brings them out in the right structure
-	arrangeTree(tree, windowsByPath, ws)
+	s := arrangementState{
+		windowsByPath: windowsByPath,
+	}
+	s.arrangeTree(tree, 0)
 }
 
-func arrangeTree(node *LayoutNode, windowsByPath map[string][]int, ws string) []int {
+type arrangementState struct {
+	windowsByPath map[string][]int
+}
+
+// helper function to find the first actual window in an arbitrarily
+// nested layout subtree
+func (s *arrangementState) firstWindow(node *LayoutNode) int {
 	if node.IsApp {
-		conIDs, ok := windowsByPath[node.Path]
-		if !ok || len(conIDs) == 0 {
-			return nil
+		windows, ok := s.windowsByPath[node.Path]
+		if ok && len(windows) > 0 {
+			return windows[0]
 		}
-		// Return all windows for this app - they become siblings in parent container
-		return conIDs
-	}
-
-	// Recursively arrange children, collecting all container IDs (flattened)
-	var childConIDs []int
-	for _, child := range node.Children {
-		conIDs := arrangeTree(child, windowsByPath, ws)
-		childConIDs = append(childConIDs, conIDs...)
-	}
-
-	if len(childConIDs) == 0 {
-		return nil
-	}
-
-	if len(childConIDs) == 1 {
-		// Bring single child out of scratchpad
-		swaymsg(fmt.Sprintf("[con_id=%d] scratchpad show", childConIDs[0]))
-		swaymsg(fmt.Sprintf("[con_id=%d] floating disable", childConIDs[0]))
-		// Set container layout if tabbed/stacking
-		if node.Layout == "tabbed" || node.Layout == "stacking" {
-			swaymsg("focus parent")
-			swaymsg(fmt.Sprintf("layout %s", node.Layout))
+	} else {
+		for _, c := range node.Children {
+			w := s.firstWindow(c)
+			if w != -1 {
+				return w
+			}
 		}
-		return childConIDs
+	}
+	return -1
+}
+
+// helper function to place a window from the scratchpad into
+// an existing layout
+//
+// this is responsible for handling the slight difference of
+// behavior between workspace root, and other nested containers
+func placeWindow(w int, d int, n int, mark string, layout string) {
+	//
+	if n > 0 || d == 0 {
+		swaymsg(fmt.Sprintf("[con_id=%d] scratchpad show", w))
+		swaymsg(fmt.Sprintf("[con_id=%d] floating disable", w))
 	}
 
-	first := childConIDs[0]
-	rest := childConIDs[1:]
-	markPath := node.Path
-	if markPath == "" {
-		markPath = "root"
+	// because sway doesn't allow empty containers, in practice,
+	// you can only create a split from an existing window, and
+	// then move other windows into it (using either __focused__
+	// as the implicit move target, or an explicit mark.
+	// except of course the root of each workspace, which is not
+	// a real container, but acts as an implicit one...
+	if n == 0 {
+		// first window of a container, create split and set layout
+		if d > 0 {
+			// keep it simple, even if not strictly optimal...
+			swaymsg(fmt.Sprintf("[con_id=%d] splith", w))
+			swaymsg(fmt.Sprintf("[con_id=%d] layout %s", w, layout))
+		}
+	} else {
+		// place window into target container, immediately after mark
+		swaymsg(fmt.Sprintf("[con_id=%d] move to mark %s", w, mark))
 	}
-	mark := fmt.Sprintf("_layout_%s", strings.ReplaceAll(markPath, ".", "_"))
+	// keep moving the mark to the latest placed window, otherwise
+	// we'd be adding windows from the config in reverse order after
+	// the first one...
+	swaymsg(fmt.Sprintf("[con_id=%d] mark --add %s", w, mark))
+}
 
-	fmt.Printf("    Grouping %d windows at path '%s' with layout %s\n", len(childConIDs), node.Path, node.Layout)
+// The core insight for reliable placement of arbitrarily nested
+// window hierarchy is to start at the root, place all windows at
+// depth 0, and for each nested container, go depth-first to find
+// one visible window that will act as a placeholder for the entire
+// subtree.
+// Then, once the root has a stable layout, process each subtre in
+// turn, splitting the first placeholder window to fill the next
+// layer of depth for that particular subtree, and keep doing so
+// recursively...
+func (s *arrangementState) arrangeTree(node *LayoutNode, d int) {
+	n := 0
+	mark := "_layout_" + node.Path
 
-	// Bring first window out and mark it as anchor
-	swaymsg(fmt.Sprintf("[con_id=%d] scratchpad show", first))
-	swaymsg(fmt.Sprintf("[con_id=%d] floating disable", first))
-	swaymsg(fmt.Sprintf("[con_id=%d] mark --add %s", first, mark))
-
-	// Set split direction before bringing in other windows
-	switch node.Layout {
-	case "splitv":
-		swaymsg("split vertical")
-	case "splith":
-		swaymsg("split horizontal")
+	for _, c := range node.Children {
+		if c.IsApp {
+			windows, ok := s.windowsByPath[c.Path]
+			if !ok || len(windows) == 0 {
+				continue
+			}
+			for _, w := range windows {
+				placeWindow(w, d, n, mark, node.Layout)
+				n += 1
+			}
+		} else {
+			w := s.firstWindow(c)
+			if w == -1 {
+				continue
+			}
+			placeWindow(w, d, n, mark, node.Layout)
+			n += 1
+			// wait for the full base level to be populated before
+			// making further splits to finish populating the subtree
+			defer s.arrangeTree(c, d+1)
+		}
 	}
-
-	// Bring others out and move to anchor's container using mark
-	for _, conID := range rest {
-		swaymsg(fmt.Sprintf("[con_id=%d] scratchpad show", conID))
-		swaymsg(fmt.Sprintf("[con_id=%d] floating disable", conID))
-		swaymsg(fmt.Sprintf("[con_id=%d] move to mark %s", conID, mark))
-	}
-
-	// Set container layout
-	swaymsg(fmt.Sprintf("[con_id=%d] focus", first))
-	swaymsg("focus parent")
-	swaymsg(fmt.Sprintf("layout %s", node.Layout))
-
-	// Clean up mark
-	swaymsg(fmt.Sprintf("[con_id=%d] unmark %s", first, mark))
-
-	return childConIDs
 }
