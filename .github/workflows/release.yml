@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build -o sway-layout -ldflags="-s -w" .
+        env:
+          GOOS: linux
+          GOARCH: amd64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sway-layout
+          generate_release_notes: true
