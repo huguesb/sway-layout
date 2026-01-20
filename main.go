@@ -263,10 +263,10 @@ func runLayout(configPath string, force bool) {
 	fmt.Println("\nLayout complete.")
 }
 
-func collectWindows(events <-chan WindowEvent, expected int) map[string]map[string]int {
+func collectWindows(events <-chan WindowEvent, expected int) map[string]map[string][]int {
 	fmt.Printf("\nWaiting for %d windows...\n", expected)
 
-	placedByWs := make(map[string]map[string]int)
+	placedByWs := make(map[string]map[string][]int)
 	placedCount := 0
 	quietDeadline := time.Now().Add(30 * time.Second)
 	quietTimeout := 3 * time.Second
@@ -284,11 +284,11 @@ func collectWindows(events <-chan WindowEvent, expected int) map[string]map[stri
 				ws, path := findSpawnMetadata(event.Container.PID)
 				if ws != "" && path != "" {
 					if placedByWs[ws] == nil {
-						placedByWs[ws] = make(map[string]int)
+						placedByWs[ws] = make(map[string][]int)
 					}
-					placedByWs[ws][path] = conID
+					placedByWs[ws][path] = append(placedByWs[ws][path], conID)
 					placedCount++
-					fmt.Printf("    Tracked: workspace=%s, path=%s\n", ws, path)
+					fmt.Printf("    Tracked: workspace=%s, path=%s (window %d at this path)\n", ws, path, len(placedByWs[ws][path]))
 				} else {
 					fmt.Printf("    No placement metadata found (external window?)\n")
 					// Show external windows back (not ours to manage)
@@ -716,12 +716,18 @@ func swaymsg(cmd string) bool {
 	return ok
 }
 
-func arrangeWorkspace(ws string, tree *LayoutNode, windowsByPath map[string]int) {
+func arrangeWorkspace(ws string, tree *LayoutNode, windowsByPath map[string][]int) {
 	if len(windowsByPath) == 0 {
 		return
 	}
 
-	fmt.Printf("  Arranging workspace %s: %d windows, root layout=%s\n", ws, len(windowsByPath), tree.Layout)
+	// Count total windows
+	totalWindows := 0
+	for _, conIDs := range windowsByPath {
+		totalWindows += len(conIDs)
+	}
+
+	fmt.Printf("  Arranging workspace %s: %d windows across %d paths, root layout=%s\n", ws, totalWindows, len(windowsByPath), tree.Layout)
 
 	// Focus workspace
 	swaymsg(fmt.Sprintf("workspace %s", ws))
@@ -731,26 +737,25 @@ func arrangeWorkspace(ws string, tree *LayoutNode, windowsByPath map[string]int)
 	arrangeTree(tree, windowsByPath, ws)
 }
 
-func arrangeTree(node *LayoutNode, windowsByPath map[string]int, ws string) int {
+func arrangeTree(node *LayoutNode, windowsByPath map[string][]int, ws string) []int {
 	if node.IsApp {
-		conID, ok := windowsByPath[node.Path]
-		if !ok {
-			return 0
+		conIDs, ok := windowsByPath[node.Path]
+		if !ok || len(conIDs) == 0 {
+			return nil
 		}
-		return conID
+		// Return all windows for this app - they become siblings in parent container
+		return conIDs
 	}
 
-	// Recursively arrange children first
+	// Recursively arrange children, collecting all container IDs (flattened)
 	var childConIDs []int
 	for _, child := range node.Children {
-		conID := arrangeTree(child, windowsByPath, ws)
-		if conID != 0 {
-			childConIDs = append(childConIDs, conID)
-		}
+		conIDs := arrangeTree(child, windowsByPath, ws)
+		childConIDs = append(childConIDs, conIDs...)
 	}
 
 	if len(childConIDs) == 0 {
-		return 0
+		return nil
 	}
 
 	if len(childConIDs) == 1 {
@@ -762,7 +767,7 @@ func arrangeTree(node *LayoutNode, windowsByPath map[string]int, ws string) int 
 			swaymsg("focus parent")
 			swaymsg(fmt.Sprintf("layout %s", node.Layout))
 		}
-		return childConIDs[0]
+		return childConIDs
 	}
 
 	first := childConIDs[0]
@@ -803,5 +808,5 @@ func arrangeTree(node *LayoutNode, windowsByPath map[string]int, ws string) int 
 	// Clean up mark
 	swaymsg(fmt.Sprintf("[con_id=%d] unmark %s", first, mark))
 
-	return first
+	return childConIDs
 }
