@@ -191,9 +191,7 @@ func waitForIPC() {
 
 // runLayout executes the layout loading mode
 func runLayout(configPath string, force bool) {
-	waitForIPC()
-	defer ipc.Close()
-
+	// Load and validate config before connecting to sway
 	config, err := loadConfig(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
@@ -210,10 +208,18 @@ func runLayout(configPath string, force bool) {
 	var allApps []AppInfo
 
 	for wsName, wsDef := range config.Workspaces {
-		tree := buildLayoutTree(wsDef, "")
+		tree, err := buildLayoutTree(wsDef, "")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error in workspace %q: %v\n", wsName, err)
+			os.Exit(1)
+		}
 		workspaceTrees[wsName] = tree
 		collectApps(tree, wsName, &allApps)
 	}
+
+	// Now connect to sway
+	waitForIPC()
+	defer ipc.Close()
 
 	// Check if target workspaces already have windows
 	if !force {
@@ -338,20 +344,20 @@ var layoutTypes = map[string]bool{
 
 // buildLayoutTree parses a workspace definition into a layout tree.
 // Format: {"layout": [...children...]} where children are commands (strings) or nested containers.
-func buildLayoutTree(wsDef interface{}, basePath string) *LayoutNode {
+func buildLayoutTree(wsDef interface{}, basePath string) (*LayoutNode, error) {
 	return parseNode(wsDef, basePath, "splith")
 }
 
-func parseNode(node interface{}, path string, parentLayout string) *LayoutNode {
+func parseNode(node interface{}, path string, parentLayout string) (*LayoutNode, error) {
 	// String = app command
 	if cmd, ok := node.(string); ok {
-		return &LayoutNode{Path: path, IsApp: true, AppCmd: cmd}
+		return &LayoutNode{Path: path, IsApp: true, AppCmd: cmd}, nil
 	}
 
 	// Map = container with layout key
 	m, ok := node.(map[string]interface{})
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("invalid node at path %q: expected string or object, got %T", path, node)
 	}
 
 	// Find the layout key (tabbed, splitv, etc.)
@@ -359,9 +365,13 @@ func parseNode(node interface{}, path string, parentLayout string) *LayoutNode {
 	var children []interface{}
 	for key, val := range m {
 		if layoutTypes[key] {
+			if layout != "" {
+				return nil, fmt.Errorf("invalid node at path %q: multiple layout keys (%s, %s)", path, layout, key)
+			}
 			layout = key
 			children, _ = val.([]interface{})
-			break
+		} else {
+			return nil, fmt.Errorf("invalid node at path %q: unknown key %q (valid layouts: splith, splitv, tabbed, stacking)", path, key)
 		}
 	}
 
@@ -376,12 +386,16 @@ func parseNode(node interface{}, path string, parentLayout string) *LayoutNode {
 		if path != "" {
 			childPath = path + "_" + childPath
 		}
-		if childNode := parseNode(child, childPath, layout); childNode != nil {
+		childNode, err := parseNode(child, childPath, layout)
+		if err != nil {
+			return nil, err
+		}
+		if childNode != nil {
 			result.Children = append(result.Children, childNode)
 		}
 	}
 
-	return result
+	return result, nil
 }
 
 func collectApps(node *LayoutNode, workspace string, apps *[]AppInfo) {
